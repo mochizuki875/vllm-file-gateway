@@ -340,7 +340,3 @@ IssueやPull Requestを歓迎します。変更は小さく保ち、関連する
 
 - [Design document](DESIGN.md)
 - [OpenAI SDK sample](samples/openai_file_response.py)
-
-## License
-
-現在、このリポジトリには`LICENSE`ファイルがありません。OSSとして公開する前にライセンスを選定し、`LICENSE`を追加してください。ライセンスが追加されるまでは、ソースコードの利用、変更、再配布に関する許諾は明示されていません。
