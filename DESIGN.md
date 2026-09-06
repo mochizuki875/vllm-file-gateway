@@ -10,13 +10,13 @@ Gatewayは、PDFおよびOffice文書をテキストとページ画像へ変換�
 
 ## 2. 設計原則
 
-1. vLLMはモデル推論だけを担当し、ファイル保存と文書変換はGatewayが担当する。
+1. vLLMはモデル推論だけを担当し、ファイル保存はGateway、画像変換は外部ライブラリが担当する。
 2. Gatewayの`file_id`をvLLMへ渡さず、抽出テキストとdata URL画像へ展開する。
 3. Files APIの変換は非同期で実行し、APIワーカーを長時間占有しない。
 4. `file_data`と`file_url`はリクエスト中だけ保持し、処理終了時に削除する。
 5. 保存ファイルは作成から6時間で失効させる。
-6. 認証トークンから導出したテナントIDを、すべての保存ファイル参照に使用する。
-7. モデル名、vLLM接続先、APIキー、データ保存先は環境変数で設定する。
+6. Authorizationから導出したテナントIDを、すべての保存ファイル参照に使用する。
+7. モデル名、vLLM接続先、認証モード、データ保存先は環境変数で設定する。
 8. 単一Gatewayインスタンスとローカル永続領域を運用単位とする。
 
 ## 3. 対応範囲
@@ -44,6 +44,7 @@ Gatewayは、PDFおよびOffice文書をテキストとページ画像へ変換�
 | `DELETE` | `/v1/files/{file_id}` | ファイルと派生データを削除する |
 | `POST` | `/v1/responses` | ファイル入力を展開してvLLM Responses APIへ転送する |
 | `POST` | `/v1/chat/completions` | ファイル入力を展開してvLLM Chat Completions APIへ転送する |
+| 各種 | `/v1/*` | 上記以外のAPIをvLLMへ透過転送する |
 
 Responses APIとChat Completions APIは同期応答だけを提供する。`stream: true`および`previous_response_id`には対応しない。
 
@@ -69,7 +70,7 @@ flowchart LR
   Client[OpenAI SDK / HTTP Client]
   API[FastAPI Gateway]
   Queue[Conversion Queue]
-  Converter[Document Converter]
+  Converter[External document-image-renderer]
   Storage[(SQLite + Filesystem)]
   VLLM[vLLM]
 
@@ -87,14 +88,17 @@ flowchart LR
 
 | モジュール | 責務 |
 | --- | --- |
-| `gateway.app` | FastAPIエンドポイント、認証、入力展開、vLLMへの転送 |
+| `gateway.main` | FastAPIエンドポイント、認証、入力展開、vLLMへの転送 |
 | `gateway.service` | ファイルライフサイクル、変換キュー、一時入力の解決、保持期限処理 |
-| `gateway.converter` | 形式別テキスト抽出、OfficeからPDFへの変換、ページ画像とマニフェストの生成 |
+| `gateway.converter` | 形式別テキスト抽出、外部ライブラリの呼び出し、マニフェストの生成 |
 | `gateway.database` | SQLiteスキーマ、所有者を含むファイル検索、状態更新 |
 | `gateway.config` | `.env`と環境変数の読み込み、設定値の検証 |
 | `gateway.errors` | GatewayエラーのOpenAI形式への変換 |
+| 外部`document-image-renderer` | OfficeからPDFへの変換、PDF描画、画像保存 |
 
-Gatewayは起動時にSQLiteスキーマを作成し、変換ワーカーと削除ワーカーを開始する。変換キューはプロセス内の`asyncio.Queue`であり、文書変換は`asyncio.to_thread`を使ってワーカースレッドで実行する。OfficeからPDFへの変換時は、LibreOfficeをタイムアウト付き子プロセスとして起動する。
+Gatewayは起動時にSQLiteスキーマを作成し、変換ワーカーと削除ワーカーを開始する。
+変換キューはプロセス内の`asyncio.Queue`であり、文書変換は`asyncio.to_thread`を使ってワーカースレッドで実行する。
+外部ライブラリはOfficeからPDFへの変換時に、LibreOfficeをタイムアウト付き子プロセスとして起動する。
 
 ## 5. ファイルライフサイクル
 
@@ -150,6 +154,10 @@ Files APIで保存したデータの有効期限は、`created_at + 21,600秒`�
 
 ## 6. 文書変換
 
+画像変換には外部の[document-image-renderer](https://github.com/mochizuki875/document-image-renderer)を使用する。
+Gatewayは`RenderOptions`で出力形式、DPI、LibreOfficeのタイムアウトを指定し、`render_document`を呼び出す。
+Gateway固有の入力検証、テキスト抽出、manifest生成は外部ライブラリへ含めない。
+
 ### 6.1 入力検証
 
 許可する拡張子は`.pdf`、`.pptx`、`.docx`、`.xlsx`である。PDFは先頭の`%PDF-`、Office文書は先頭のZIPローカルファイルヘッダー`PK\x03\x04`を確認する。
@@ -163,27 +171,17 @@ Files APIで保存したデータの有効期限は、`created_at + 21,600秒`�
 - DOCXは本文段落と表セルを一つのテキストブロックへ連結する。
 - XLSXはワークシートごとにセル値をタブ区切りで出力する。数式は計算せず、数式文字列を使用する。
 
-Office文書のテキストブロック数と、LibreOfficeが生成するPDFページ数は一致しない場合がある。対応するテキストブロックがないページでは、PDFから抽出したテキストを使用する。
+Office文書のテキストブロック数と、LibreOfficeが生成するPDFページ数は一致しない場合がある。対応するテキストブロックがないページでは、空のテキストを使用する。
 
 ### 6.3 ページ画像
 
-PDFまたはLibreOfficeが生成したPDFを、PyMuPDFで150 DPIのRGB画像として描画する。画像は長辺2,048 px以内へ縮小し、可逆WebPとして保存する。透過は使用しない。
+PDFまたはLibreOfficeが生成したPDFを、外部ライブラリが150 DPIのRGB画像として描画し、PNGとして保存する。透過は使用しない。
 
-変換可能な文書は最大20ページまたは20生成画像である。上限を超えた場合は変換を失敗させる。
+変換可能な文書は最大20生成画像である。外部ライブラリによる描画後に上限を検査し、超過した場合は生成画像を削除して変換を失敗させる。
 
 Microsoft OfficeとLibreOfficeではレイアウト、改ページ、フォント置換が異なる場合がある。GatewayはMicrosoft Officeとの画素単位の一致を保証しない。
 
-### 6.4 PPTX補正
-
-PPTXは元ファイルを直接変更せず、一時コピーのOOXMLを補正してからLibreOfficeへ渡す。補正対象は次のとおりである。
-
-- 負の図形サイズの正規化
-- 一行テキストの推定幅に応じた折り返し抑制
-- スライド中心との位置関係に基づく放射状矢印の向き補正
-
-補正はLibreOfficeでの静的表示を改善するためのヒューリスティックであり、すべてのPPTXに対する正確性を保証しない。
-
-### 6.5 変換マニフェスト
+### 6.4 変換マニフェスト
 
 変換結果は`manifest.json`へ保存する。
 
@@ -201,11 +199,11 @@ PPTXは元ファイルを直接変更せず、一時コピーのOOXMLを補正�
       "pages": [
         {
           "page_number": 1,
-          "image_path": "page-0001.webp",
+          "image_path": "source-page-0001.png",
           "text_path": "page-0001.txt",
           "width": 1448,
           "height": 2048,
-          "media_type": "image/webp",
+          "media_type": "image/png",
           "sha256": "..."
         }
       ]
@@ -221,7 +219,7 @@ PPTXは元ファイルを直接変更せず、一時コピーのOOXMLを補正�
 
 ### 7.1 ファイル解決
 
-`file_id`は、認証トークンから導出したテナントIDと組み合わせてSQLiteから検索する。別のトークンが所有するID、削除済みID、失効済みIDはすべて`404 file_not_found`として扱う。
+`file_id`は、Authorizationから導出したテナントIDと組み合わせてSQLiteから検索する。別のAuthorizationが所有するID、削除済みID、失効済みIDはすべて`404 file_not_found`として扱う。Authorizationがない場合は共通の匿名テナントIDを使用する。
 
 `file_data`は厳密なbase64検証を行い、`GATEWAY_DATA_DIR/work`配下の一時ディレクトリへ保存して同期変換する。`file_url`も同じ一時領域へダウンロードして同期変換する。一時領域はvLLM応答、Gatewayエラー、タイムアウトのいずれの場合もリクエスト終了時に削除する。
 
@@ -238,7 +236,7 @@ PPTXは元ファイルを直接変更せず、一時コピーのOOXMLを補正�
   {
     "type": "input_image",
     "detail": "auto",
-    "image_url": "data:image/webp;base64,..."
+    "image_url": "data:image/png;base64,..."
   }
 ]
 ```
@@ -258,7 +256,7 @@ PPTXは元ファイルを直接変更せず、一時コピーのOOXMLを補正�
   {
     "type": "image_url",
     "image_url": {
-      "url": "data:image/webp;base64,..."
+      "url": "data:image/png;base64,..."
     }
   }
 ]
@@ -286,6 +284,8 @@ Gatewayは外部APIと同種のvLLMエンドポイントへHTTP POSTする。
 - `/v1/responses`は`{VLLM_BASE_URL}/responses`へ転送する。
 - `/v1/chat/completions`は`{VLLM_BASE_URL}/chat/completions`へ転送する。
 
+明示的に実装していない`/v1/*`は、HTTPメソッド、クエリ、本文、Content-Typeを維持して同じvLLMパスへ転送する。任意認証モードでは受信したAuthorizationがあれば維持し、必須認証モードでは`VLLM_API_KEY`へ差し替える。Host、Content-Lengthおよびhop-by-hopヘッダーは転送しない。Files API名前空間はGatewayが所有し、未実装メソッドを透過転送しない。
+
 リクエストの`model`は`VLLM_MODEL`と完全一致する必要がある。不一致の場合は`404 model_not_found`を返す。
 
 ファイルcontent part、`instructions`、Chat Completionsの`messages`以外のフィールドは、受け取ったJSON値を維持してvLLMへ転送する。パラメーターの実際の対応範囲は、vLLMのバージョン、設定モデル、チャットテンプレート、ツールパーサーに依存する。
@@ -303,7 +303,7 @@ vLLMのHTTP応答は、ステータスコード、本文、基本メディアタ
 | 列 | 内容 |
 | --- | --- |
 | `id` | 外部公開するランダムな`file_id` |
-| `tenant_id` | APIキーのSHA-256から導出した所有者ID |
+| `tenant_id` | Authorizationまたは匿名値のSHA-256から導出した所有者ID |
 | `filename` | ベース名へ正規化した表示名 |
 | `media_type` | 拡張子に対応するメディアタイプ |
 | `purpose` | `user_data` |
@@ -328,18 +328,20 @@ GATEWAY_DATA_DIR/
 │           ├── source.<ext>
 │           ├── manifest.json
 │           └── derived/
-│               ├── page-0001.webp
+│               ├── source-page-0001.png
 │               └── page-0001.txt
 └── work/
 ```
 
 `work`には`file_data`と`file_url`用の一時ディレクトリを作成する。Files APIで保存するデータとSQLiteは、同じ永続ボリュームに配置する必要がある。
 
-## 10. 認証とテナント分離
+## 10. Authorization転送とテナント分離
 
-`/v1`以下のAPIは`Authorization: Bearer <token>`を要求する。トークンは`GATEWAY_API_KEY`と定時間比較する。
+`GATEWAY_AUTH_REQUIRED=false`では、`/v1`以下のAuthorizationは任意である。Gatewayは値を照合せず、vLLMへ転送するAPIでは受信したAuthorizationを維持する。Authorizationがない場合は認証ヘッダーを追加せず、APIキーを要求するかどうかと、その認証はvLLMが決定する。
 
-現在の設定は単一APIキーである。テナントIDは受信トークンのSHA-256先頭32文字から導出し、ファイルの作成、検索、一覧、削除に使用する。この設計によりデータアクセス処理は所有者条件を持つが、複数の有効APIキーを発行・管理する機能は提供しない。
+`GATEWAY_AUTH_REQUIRED=true`では、すべての`/v1`リクエストに`GATEWAY_API_KEY`をBearerトークンとして要求し、Gatewayで定時間比較する。vLLMへ転送する際はAuthorizationを`VLLM_API_KEY`へ差し替える。両キーが未設定の場合はGatewayの起動を拒否する。
+
+テナントIDは受信Bearer値からSHA-256先頭32文字を導出し、ファイルの作成、検索、一覧、削除に使用する。任意モードでAuthorizationがない場合は、空文字列から導出した共通の匿名テナントIDを使用する。
 
 `GET /health`は認証を要求せず、Gatewayプロセスの稼働だけを示す。SQLite、LibreOffice、vLLMへの接続性は検査しない。
 
@@ -355,7 +357,7 @@ GATEWAY_DATA_DIR/
 - リダイレクト先にも同じURL検証を適用
 - 環境のHTTPプロキシ設定を使用しない
 - 応答をストリーム受信し、ファイルサイズ上限を適用
-- Cookie、Gateway APIキー、vLLM APIキーを取得先へ送らない
+- CookieやAuthorizationヘッダーを取得先へ送らない
 
 DNS検証後の接続先IP固定は行っていないため、DNS rebindingを完全には防止しない。公開環境では、URL取得をネットワークレベルでも制限された別サービスへ分離することが望ましい。
 
@@ -365,11 +367,13 @@ DNS検証後の接続先IP固定は行っていないため、DNS rebindingを�
 | --- | --- | --- |
 | `VLLM_MODEL` | なし | 1文字以上、必須 |
 | `VLLM_BASE_URL` | なし | `/v1`で終わるHTTPまたはHTTPS URL、必須 |
-| `VLLM_API_KEY` | なし | 1文字以上、必須 |
-| `GATEWAY_API_KEY` | なし | 1文字以上、必須 |
+| `GATEWAY_AUTH_REQUIRED` | `false` | GatewayでAPIキーを検証するか |
+| `GATEWAY_API_KEY` | なし | 必須認証モードのクライアントキー |
+| `VLLM_API_KEY` | なし | 必須認証モードでvLLMへ送るキー |
 | `GATEWAY_DATA_DIR` | `gateway-data` | SQLiteと文書データの保存先 |
 | `FILE_TTL_SECONDS` | `21600` | 現在は`21600`だけを許可 |
 | `MAX_FILE_BYTES` | `52428800` | ファイル入力の最大バイト数 |
+| `MAX_DOCUMENT_PAGES` | `20` | 文書ごとに変換可能なページ数 |
 | `MAX_DOCUMENT_IMAGES` | `8` | 文書ごとにvLLMへ送る画像数 |
 | `REQUEST_TIMEOUT_SECONDS` | `300` | vLLM要求のタイムアウト秒数 |
 
@@ -400,7 +404,6 @@ Gatewayが生成するエラーは次の形式で返す。
 | 400 | `invalid_file_url` | URLまたは取得結果が許可条件外 |
 | 400 | `too_many_pages` | 一時入力のページ上限超過 |
 | 400 | `unsupported_feature` | ストリーミングまたは会話状態を要求 |
-| 401 | `invalid_api_key` | 認証失敗 |
 | 404 | `file_not_found` | ファイルが存在しないか参照不可 |
 | 404 | `model_not_found` | モデル名が設定値と不一致 |
 | 409 | `file_not_ready` | 保存ファイルを変換中 |
@@ -408,13 +411,12 @@ Gatewayが生成するエラーは次の形式で返す。
 | 502 | `model_upstream_error` | vLLMへ接続できない |
 | 504 | `model_timeout` | vLLM要求がタイムアウト |
 
-Files APIのバックグラウンド変換で20ページ上限を超えた場合、Fileオブジェクトは`status: "error"`になる。一時入力の同期変換では`400 too_many_pages`を返す。
+Files APIのバックグラウンド変換でページ上限を超えた場合、Fileオブジェクトは`status: "failed"`になる。一時入力の同期変換では`400 too_many_pages`を返す。
 
 ## 14. セキュリティ境界
 
 現在の実装には次の対策が含まれる。
 
-- Bearerトークンの定時間比較
 - テナントIDを条件に含めたファイル参照
 - ファイル名からディレクトリ部分を除去
 - 拡張子と基本シグネチャの検証
@@ -422,7 +424,7 @@ Files APIのバックグラウンド変換で20ページ上限を超えた場合
 - LibreOfficeの一時ユーザープロファイルと実行タイムアウト
 - 文書データをモデル命令と区別する追加指示
 - 6時間後の論理削除と物理削除
-- vLLM認証情報を外部URLへ転送しないHTTPクライアント分離
+- クライアントのAuthorizationを外部ファイルURLへ転送しないHTTPクライアント分離
 
 現在の実装には次の機能を含まない。
 
@@ -461,13 +463,13 @@ Files APIのバックグラウンド変換で20ページ上限を超えた場合
 - vLLM固有の非対応パラメーターは、上流のステータスと本文のまま返る場合がある。
 - Responses APIでは画像の`detail`を常に`auto`としてvLLMへ送る。
 - 文書ごとの画像上限を超えたページもテキストは送るため、長い文書ではコンテキスト上限を超える可能性がある。
-- PDF化後の最大20ページ制限により、入力上のスライド数、シート数、論理ページ数と受理可否が一致しない場合がある。
+- PDF化後のページ数制限により、入力上のスライド数、シート数、論理ページ数と受理可否が一致しない場合がある。
 
 ## 17. テスト方針
 
 自動テストは、外部vLLMをモックして次の境界を確認する。
 
-- Bearer認証とヘルスチェック
+- 任意Authorizationの転送、匿名ファイルスコープ、ヘルスチェック
 - Files APIの作成、状態遷移、取得、内容取得、一覧、削除
 - 所有者トークンによるファイル分離
 - Chat Completions APIの`file_id`展開

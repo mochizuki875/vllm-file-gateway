@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AnyHttpUrl, Field, field_validator
+from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,11 +16,13 @@ class Settings(BaseSettings):
 
     vllm_model: str = Field(min_length=1)
     vllm_base_url: AnyHttpUrl
-    vllm_api_key: str = Field(min_length=1)
-    gateway_api_key: str = Field(min_length=1)
+    gateway_auth_required: bool = False
+    gateway_api_key: str | None = None
+    vllm_api_key: str | None = None
     gateway_data_dir: Path = Path("gateway-data")
     file_ttl_seconds: int = 21_600
     max_file_bytes: int = 50 * 1024 * 1024
+    max_document_pages: int = Field(default=20, ge=1)
     max_document_images: int = Field(default=8, ge=1)
     request_timeout_seconds: float = 300.0
 
@@ -37,6 +39,12 @@ class Settings(BaseSettings):
         if value != 21_600:
             raise ValueError("FILE_TTL_SECONDS must be 21600")
         return value
+
+    @model_validator(mode="after")
+    def require_auth_keys(self) -> Settings:
+        if self.gateway_auth_required and (not self.gateway_api_key or not self.vllm_api_key):
+            raise ValueError("GATEWAY_API_KEY and VLLM_API_KEY are required when GATEWAY_AUTH_REQUIRED=true")
+        return self
 
     @property
     def database_url(self) -> str:

@@ -33,9 +33,6 @@ htmlcov/
 /gateway-data/
 *.log
 
-# PoC generated output
-/poc_image_convert/docs_output/
-
 # Editor and operating-system files
 .idea/
 *.swp

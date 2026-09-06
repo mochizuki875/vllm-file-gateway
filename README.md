@@ -8,17 +8,10 @@ PDF、PowerPoint、Word、Excelを画像とテキストへ変換し、OpenAI互�
 vLLM単体では解決できないFiles APIの`file_id`やOffice文書をGatewayが処理し、ユーザーのプロンプト、抽出テキスト、ページ画像をResponses APIまたはChat Completions APIへ組み立て直します。元の文書ファイルやGatewayの`file_id`はvLLMへ渡しません。
 
 ## Features
-
-- PDF、PPTX、DOCX、XLSXの非同期変換
-- PyMuPDFによるPDFページ画像とテキストの生成
-- LibreOfficeによるOffice文書のPDF化
-- OpenAI互換のFiles API
-- OpenAI互換のResponses APIとChat Completions API
+- OpenAI互換の[Files API](https://developers.openai.com/api/reference/java/resources/files)
+- OpenAI互換の[Responses API](https://developers.openai.com/api/reference/responses/overview)
+- OpenAI互換の[Chat Completions API](https://developers.openai.com/api/reference/chat-completions/overview)
 - `file_id`、base64の`file_data`、公開HTTPSの`file_url`入力
-- SQLiteとローカルファイルシステムによる状態管理
-- Bearer認証とAPIキー単位のファイル分離
-- アップロードから6時間後の自動失効・削除
-- OpenAI Python SDKからの利用
 
 ### Supported APIs
 
@@ -32,6 +25,7 @@ vLLM単体では解決できないFiles APIの`file_id`やOffice文書をGateway
 | Delete file | `DELETE /v1/files/{file_id}` | Supported |
 | Responses | `POST /v1/responses` | Synchronous requests only |
 | Chat Completions | `POST /v1/chat/completions` | Synchronous requests only |
+| Other vLLM APIs | `/v1/*` | Passed through to vLLM |
 
 ## How It Works
 
@@ -39,7 +33,7 @@ vLLM単体では解決できないFiles APIの`file_id`やOffice文書をGateway
 flowchart LR
   Client[OpenAI SDK / HTTP client]
   Gateway[vLLM File Gateway]
-  Converter[Document converter]
+  Converter[External document-image-renderer]
   Storage[(SQLite + local files)]
   VLLM[vLLM multimodal model]
 
@@ -52,50 +46,88 @@ flowchart LR
 ```
 
 1. Files APIが文書を保存し、`status: "uploaded"`を返します。
-2. バックグラウンドワーカーが文書をWebP画像とテキストへ変換します。
+2. バックグラウンドワーカーが文書をPNG画像とテキストへ変換します。
 3. 変換完了後、Fileオブジェクトが`status: "processed"`になります。
 4. ResponsesまたはChat Completionsのファイル参照を、テキストとdata URL画像へ展開します。
 5. 展開後のリクエストを同種のvLLM APIへ転送します。
+
+上記以外の`/v1/*`リクエストは、メソッド、クエリ、本文、Content-Typeを維持してvLLMへ転送します。Files APIのパスはGatewayが所有するため、未実装のメソッドをvLLMへ転送しません。
 
 `file_data`と`file_url`はリクエストスコープで変換され、応答後に一時ファイルを削除します。Files APIでアップロードしたデータは作成から6時間保持されます。
 
 ## Requirements
 
-- Python 3.13
-- LibreOffice Writer、Impress、Calc
-- Noto CJKフォント
-- Carlitoフォント
+- Python 3.10以降
+- 文書画像変換の動作要件は[document-image-renderer](https://github.com/mochizuki875/document-image-renderer)を参照
 - Responses APIまたはChat Completions APIで画像入力を処理できるvLLMサーバー
 
-Gemma 4で動作確認していますが、Gateway自体は特定モデル専用ではありません。画像入力数、コンテキスト長、チャットテンプレートなどの制約は、使用するモデルとvLLM構成に合わせてください。
+Gateway自体は特定モデル専用ではありません。
+画像入力数、コンテキスト長、チャットテンプレートなどの制約は、使用するモデルとvLLM構成に合わせてください。
 
-## Quick Start
+## Installation
 
-### Dev Container
-
-VS CodeでリポジトリをDev Containerとして開き、依存関係をインストールします。
+リポジトリをcloneし、Python仮想環境へGatewayをインストールします。
 
 ```bash
+git clone https://github.com/mochizuki875/vllm-file-gateway.git
+cd vllm-file-gateway
 python -m venv .venv
-./.venv/bin/pip install -r requirements.txt
-cp .env.example .env
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
-`.env`へvLLM接続情報とGatewayのAPIキーを設定します。
+Windows PowerShellでは、仮想環境を次のように作成して有効化します。
+
+```powershell
+python --version
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+```
+
+設定ファイルを作成します。
+
+```bash
+cp .env.example .env
+```
+```
+VLLM_MODEL=your-model-name
+VLLM_BASE_URL=http://vllm-base-url:port/v1
+GATEWAY_AUTH_REQUIRED=false
+GATEWAY_API_KEY=your-gateway-api-key
+VLLM_API_KEY=your-vllm-api-key
+GATEWAY_DATA_DIR=./gateway-data
+MAX_DOCUMENT_PAGES=20
+MAX_DOCUMENT_IMAGES=8
+```
+
+
+<details><summary>Windows PowerShell</summary>
+
+Windows PowerShellでは`Copy-Item .env.example .env`を使用します。
+`.env`へvLLM接続情報と認証モードを設定します。
 
 ```dotenv
 VLLM_MODEL=your-multimodal-model
 VLLM_BASE_URL=http://your-vllm-host:8000/v1
-VLLM_API_KEY=your-vllm-api-key
-GATEWAY_API_KEY=change-this-gateway-key
+GATEWAY_AUTH_REQUIRED=false
+GATEWAY_API_KEY=
+VLLM_API_KEY=
 GATEWAY_DATA_DIR=./gateway-data
+MAX_DOCUMENT_PAGES=20
 MAX_DOCUMENT_IMAGES=8
 ```
+
+</details>
+
+
+
+## Running the Gateway
 
 Gatewayを起動します。
 
 ```bash
-./.venv/bin/uvicorn gateway.app:app --host 0.0.0.0 --port 8080
+python -m uvicorn gateway.main:app --host 0.0.0.0 --port 8080
 ```
 
 別のターミナルからヘルスチェックします。
@@ -104,7 +136,9 @@ Gatewayを起動します。
 curl http://localhost:8080/health
 ```
 
-### Docker
+`{"status":"ok"}`が返ればGatewayは起動しています。
+
+## Docker
 
 Composeはカレントディレクトリの`.env`を読み取り、vLLM接続情報とAPIキーをコンテナの環境変数へ渡します。
 
@@ -124,28 +158,17 @@ docker compose down
 保存済みファイルとSQLiteデータベースはコンテナ内だけに保存され、コンテナを削除すると失われます。
 公開ポートを変更する場合は、起動時に`GATEWAY_PORT=18080`のように指定できます。
 
-Composeを使わずに起動する場合は次を実行します。
-
-```bash
-docker build -t vllm-file-gateway .
-docker run --rm -p 8080:8080 \
-  --env-file .env \
-  -e GATEWAY_DATA_DIR=/var/lib/file-gateway \
-  -v vllm-file-gateway-data:/var/lib/file-gateway \
-  vllm-file-gateway
-```
-
-コンテナから到達できるURLを`VLLM_BASE_URL`へ指定してください。vLLMがホスト側で動作している場合、コンテナ内の`localhost`はvLLMホストを指しません。
-
 ## Configuration
 
 | Environment variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `VLLM_MODEL` | Yes | None | クライアント要求とvLLM転送に使用するモデル名 |
 | `VLLM_BASE_URL` | Yes | None | vLLMのOpenAI互換ベースURL。`/v1`で終わる絶対URL |
-| `VLLM_API_KEY` | Yes | None | GatewayからvLLMへ送るBearerトークン |
-| `GATEWAY_API_KEY` | Yes | None | クライアントがGatewayへ送るBearerトークン |
+| `GATEWAY_AUTH_REQUIRED` | No | `false` | `true`の場合はGatewayでAPIキーを検証 |
+| `GATEWAY_API_KEY` | Conditional | None | Gateway認証用キー。`GATEWAY_AUTH_REQUIRED=true`の場合は必須 |
+| `VLLM_API_KEY` | Conditional | None | GatewayからvLLMへ送るキー。`GATEWAY_AUTH_REQUIRED=true`の場合は必須 |
 | `GATEWAY_DATA_DIR` | No | `gateway-data` | SQLite、元ファイル、派生データの保存先 |
+| `MAX_DOCUMENT_PAGES` | No | `20` | 1文書で変換可能な最大ページ数 |
 | `MAX_DOCUMENT_IMAGES` | No | `8` | 1文書からvLLMへ送る画像の最大数。テキストは全ページ分を送信 |
 | `FILE_TTL_SECONDS` | No | `21600` | ファイル保持秒数。現在は21600以外を拒否 |
 | `MAX_FILE_BYTES` | No | `52428800` | 1ファイルの最大バイト数 |
@@ -155,112 +178,133 @@ docker run --rm -p 8080:8080 \
 
 ## Usage
 
-すべての`/v1`リクエストにGatewayのBearerトークンが必要です。
+`GATEWAY_AUTH_REQUIRED`で次の2モードを選択できます。
 
-### OpenAI Python SDK
+- `false`（既定）: APIキーは任意です。受信した`Authorization`があればそのままvLLMへ転送し、なければ認証ヘッダーなしで転送します。認証の要否はvLLMが決定します。
+- `true`: `GATEWAY_API_KEY`をクライアントへ要求してGatewayで検証し、vLLMへは`VLLM_API_KEY`を送ります。両方のキー設定が必須です。
 
-[samples/openai_file_response.py](samples/openai_file_response.py)は、アップロード、変換完了待ち、Responses API実行、削除までを行います。途中で失敗した場合も、アップロード済みファイルの削除を試みます。
-
-次のコマンドは、Quick Startで作成した`.env`のAPIキーとモデル、およびリポジトリに同梱したPDFを使用します。Gatewayを起動した状態で、リポジトリのルートから実行してください。
+`OPENAI_BASE_URL`にはGatewayのURLを指定します。`OPENAI_API_KEY`には、任意モードではvLLMのAPIキー、必須モードでは`GATEWAY_API_KEY`を指定します。
 
 ```bash
 set -a
 . ./.env
 set +a
 
-OPENAI_BASE_URL=http://localhost:8080/v1 \
-OPENAI_API_KEY="$GATEWAY_API_KEY" \
-OPENAI_MODEL="$VLLM_MODEL" \
-./.venv/bin/python samples/openai_file_response.py \
-  samples/docs_input/samplefile.pdf \
-  --prompt 'この文章の内容を200文字程度で要約してください'
+export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_API_KEY="$GATEWAY_API_KEY"
+export OPENAI_MODEL="$VLLM_MODEL"
+```
+
+### OpenAI Python SDK
+
+[example/openai_file_summary.py](example/openai_file_summary.py)は、`example/report.docx`をFiles APIへアップロードし、変換完了後にResponses APIで内容を要約します。
+処理の成否にかかわらず、アップロードしたファイルの削除を試みます。
+
+サンプル用の依存関係をインストールします。
+
+```bash
+python -m pip install -e '.[example]'
+```
+
+Gatewayを起動した状態で以下を実行します。
+```bash
+python example/openai_file_summary.py
 ```
 
 実行結果:
-
 ```text
-uploaded: file_c2832f673849417e90b09b0c6029b89d (status=uploaded)
-processed: file_c2832f673849417e90b09b0c6029b89d
-response:
-Kubernetesは、コンテナ化されたアプリケーションの配置やスケーリングを自動化するオーケストレーション基盤です。「望ましい状態」を宣言し、それを維持するReconciliation（判別）という仕組みが核心です。主要なコンポーネント（Control Plane/Worker Node）やPod、Deployment、Serviceなどの基本リソースを活用し、監視・セキュリティ・安 全性などを設計に含めることが、安定した運用には不可欠です。
-deleted: file_c2832f673849417e90b09b0c6029b89d (deleted=True)
+Uploaded: file_1d9aa0d6a8f64276827adfab4604e83c
+Processed: file_1d9aa0d6a8f64276827adfab4604e83c
+# Python実践入門：要約
+
+## 概要
+Pythonは1991年にGuido van Rossumが開発した高水準・汎用プログラミング言語。読みやすい構文、広大なエコシステム、高い開発生産性が特徴。
+
+## 人気の理由
+- **読みやすい構文**：インデントによるブロック構造
+- **大規模エコシステム**：PyPIに多数のサードパーティ製パッケージ
+- **クロスプラットフォーム**：Linux・Windows・macOSなどで動作
+- **迅速な開発**：動的型付け、対話型インタープリタ、豊富な標準ライブラリ
+
+## 基本構文とデータ型
+- インデントでブロックを定義（波括弧なし）
+- 型宣言は不要（型ヒントは任意）
+- 主要なデータ型：int、float、str、bool、list、tuple、dict、set、None
+
+## 関数・モジュール・OOP
+- `def`キーワードで関数定義、型アノテーション対応
+- クラスによるオブジェクト指向も可能だが、必須ではない
+- 関数、モジュール、内包表記などのシンプルな設計が好まれる
+
+## 環境管理
+- `venv`による仮想環境と`pip`によるパッケージ管理が標準
+
+## 主な用途
+- Web開発（Django、Flask、FastAPI）
+- データ分析・AI（NumPy、pandas、PyTorch、scikit-learn）
+- 自動化・スクリプト、DevOps・クラウド、科学計算
+
+## 長所とトレードオフ
+- 開発生産性と表現力を最優先
+- CPU負荷の高い処理ではC/C++/Rustより遅いが、ネイティブライブラリや非同期処理で補完可能
+
+## 推奨ワークフロー
+Python 3の導入 → プロジェクトごとに仮想環境作成 → 依存関係管理（pyproject.toml）→ フォーマット・lint・テスト → シンプルで読みやすいコードを維持
+
+**結論**：Pythonは小規模スクリプトから大規模本番システムまで対応できる、読みやすく実用的な言語。
+Deleted: file_1d9aa0d6a8f64276827adfab4604e83c
 ```
 
 ### curl
 
-次の一連のコマンドは、アップロード、変換完了待ち、Responses APIへの質問、削除を実行します。`FILE_ID`はアップロード結果から自動取得するため、手入力は不要です。
+次の例ではJSONの処理に`jq`を使用します。アップロード、変換完了待ち、Responses APIへの質問、削除を順に実行します。`DOCUMENT`には手元のPDF、PPTX、DOCX、XLSXのパスを指定してください。
 
 ```bash
-set -a
-. ./.env
-set +a
+DOCUMENT=example/report.docx
 
-BASE_URL=http://localhost:8080/v1
-DOCUMENT=samples/docs_input/samplefile.pdf
-
-upload_response=$(curl --silent --show-error "$BASE_URL/files" \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+# 1. 文書をアップロードし、返されたファイルIDを取得する(POST /files)
+FILE_ID=$(curl --silent --show-error "$OPENAI_BASE_URL/files" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F purpose=user_data \
-  -F "file=@$DOCUMENT")
-printf '%s\n' "$upload_response"
+  -F "file=@$DOCUMENT" | jq -r '.id')
+echo "Uploaded: $FILE_ID"
 
-FILE_ID=$(printf '%s' "$upload_response" | \
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+# 2. 文書のアップロード確認(GET /files/{file_id})
+# "status": "processed"となることを確認する
+curl --silent --show-error "$OPENAI_BASE_URL/files/$FILE_ID" -H "Authorization: Bearer $OPENAI_API_KEY" | jq .
 
-while true; do
-  file_response=$(curl --silent --show-error "$BASE_URL/files/$FILE_ID" \
-    -H "Authorization: Bearer $GATEWAY_API_KEY")
-  printf '%s\n' "$file_response"
-  status=$(printf '%s' "$file_response" | \
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')
-  case "$status" in
-    processed) break ;;
-    error) echo 'Document conversion failed.' >&2; exit 1 ;;
-    *) sleep 0.5 ;;
-  esac
-done
-
-response=$(curl --silent --show-error "$BASE_URL/responses" \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+# 3. 変換済みの文書を指定してResponses APIへ質問する(POST /responses)
+curl --silent --show-error "$OPENAI_BASE_URL/responses" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$VLLM_MODEL\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_file\",\"file_id\":\"$FILE_ID\"},{\"type\":\"input_text\",\"text\":\"この文章の内容を200文字程度で要約してください\"}]}]}")
+  -d "{\"model\":\"$VLLM_MODEL\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_file\",\"file_id\":\"$FILE_ID\"},{\"type\":\"input_text\",\"text\":\"この文章の内容を200文字程度で要約してください\"}]}]}" | \
+  jq '{id, status, output_text: [.output[].content[] | select(.type == "output_text").text] | join("")}'
 
-printf '%s' "$response" | python3 -c '
-import json
-import sys
-
-data = json.load(sys.stdin)
-text = "".join(
-    part.get("text", "")
-    for item in data.get("output", [])
-    for part in item.get("content", [])
-    if part.get("type") == "output_text"
-)
-print(json.dumps({
-    "id": data.get("id"),
-    "status": data.get("status"),
-    "output_text": text,
-}, ensure_ascii=False, indent=2))
-'
-
-curl --silent --show-error -X DELETE "$BASE_URL/files/$FILE_ID" \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
+# 4. アップロードした文書を削除する(DELETE /files/{file_id})
+curl --silent --show-error -X DELETE "$OPENAI_BASE_URL/files/$FILE_ID" \
+  -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
 実行結果:
-
 ```text
-{"id":"file_4bf10011f74b4a928f8b97f86dee3137","object":"file","bytes":127370,"created_at":1788451465,"expires_at":1788473065,"filename":"samplefile.pdf","purpose":"user_data","status":"uploaded"}
-{"id":"file_4bf10011f74b4a928f8b97f86dee3137","object":"file","bytes":127370,"created_at":1788451465,"expires_at":1788473065,"filename":"samplefile.pdf","purpose":"user_data","status":"processed"}
+Uploaded: file_1de626e84b0a4631b7f176d5c69f1d02
 {
-  "id": "resp_bac8f045a335006c",
-  "status": "completed",
-  "output_text": "Kubernetesは、コンテナ化されたアプリケーションの配置や運用を自動化するオーケストレーション基盤です。「望ましい状態」を宣言し、それを継続的に維持するReconciliation（調律）という仕組みが核心です。Control PlaneやWorker Node、Pod、Deployment、Serviceといった要素で構成されます。実運用では、スケーリングや可用性、監視、セキュリティ、アップグレードを含めた設計が重要となります。"
+  "id": "file_1de626e84b0a4631b7f176d5c69f1d02",
+  "object": "file",
+  "bytes": 40578,
+  "created_at": 1788710947,
+  "expires_at": 1788732547,
+  "filename": "report.docx",
+  "purpose": "user_data",
+  "status": "processed"
 }
-{"id":"file_4bf10011f74b4a928f8b97f86dee3137","object":"file","deleted":true}
+{
+  "id": "resp_87aecd851c06dd90",
+  "status": "completed",
+  "output_text": "Pythonは1991年公開の高水準汎用言語。可読性の高い構文、豊富なライブラリ、クロスプラットフォーム対応が特徴で、インデントによるブロック表現や動的型付けを採用する。関数・クラス・仮想環境などの機能を持ち、Web開発、データ分析・AI、自動化、DevOpsなど幅広い分野で活用される。実行速度はC++等に劣るが、開発生産性と拡張性に優れ、初学者から大規模システムまで実用的な選択肢となる。"
+}
+{"id":"file_1de626e84b0a4631b7f176d5c69f1d02","object":"file","deleted":true}
 ```
-
-IDと時刻は実行ごとに変わります。GETリクエストに`-F`を指定するとcurlがPOSTとして送信するため、状態取得では`-F`を使用しません。
 
 ### Input Forms
 
@@ -278,7 +322,7 @@ IDと時刻は実行ごとに変わります。GETリクエストに`-F`を指�
 
 - 対応形式は`.pdf`、`.pptx`、`.docx`、`.xlsx`です。
 - 1ファイルの既定上限は50 MiBです。
-- 1文書は最大20ページまたは20生成画像です。
+- 1文書のページ数は`MAX_DOCUMENT_PAGES`で制限します。
 - vLLMへ送る画像数は`MAX_DOCUMENT_IMAGES`で制限します。
 - Files APIの`purpose`は`user_data`だけを受け付けます。
 - Files APIは非同期です。推論前に`status: "processed"`を確認してください。
@@ -297,46 +341,57 @@ IDと時刻は実行ごとに変わります。GETリクエストに`-F`を指�
 - ログへ文書本文を明示的には出力しません。
 - `.env`と`gateway-data/`をGit管理対象から除外しています。
 
+任意モードのFiles APIはvLLMへリクエストしないため、APIキーを検証しません。Authorizationがある場合は、その値から導出したハッシュをファイル所有範囲の分離に使用します。Authorizationがないリクエストはすべて同じ匿名ファイルスコープを共有します。必須モードではFiles APIもGatewayで認証されます。
+
 現在の実装には、コンテナ・プロセスレベルの完全なパーサー隔離、マルウェアスキャン、高可用構成、レート制限、保存時暗号化は含まれていません。インターネットへ公開する前に、リバースプロキシでTLS、認証、リクエストサイズ制限、レート制限を追加し、変換処理の隔離を強化してください。脆弱性を見つけた場合は、公開Issueへ機密情報や再現用文書を添付しないでください。
 
 ## Project Structure
 
 ```text
-gateway/                  FastAPI、Files管理、文書変換、vLLM転送
-samples/                  OpenAI SDKサンプルと評価用文書
-tests/                    Gatewayの自動テスト
-poc_image_convert/        画像変換の初期PoC
-.devcontainer/            開発用コンテナ
-DESIGN.md                 設計、互換性、段階的な拡張方針
-Dockerfile                Gateway実行イメージ
+vllm-file-gateway/
+├── pyproject.toml                 依存ライブラリとパッケージの設定
+├── src/
+│   └── gateway/                   FastAPI、Files管理、テキスト抽出、vLLM転送
+├── example/                       OpenAI SDKの利用例と入力文書
+├── tests/
+│   └── test_app/                  GatewayのAPIテスト
+├── DESIGN.md                      設計と実装境界
+├── LICENSE                        Apache License 2.0
+└── Dockerfile                     Gateway実行イメージ
 ```
 
-`gateway`は`poc_image_convert`をimportせず、独立した実装として動作します。
+`gateway`は外部の`document-image-renderer`が提供するPython APIを使用します。
+依存関係は再現可能にするため、`pyproject.toml`で`v0.1.0`タグを指定しています。
+Gateway固有のテキスト抽出、manifest生成、保存処理は`gateway`が担当します。
+
+## Dev Container
+
+`.devcontainer/`は、Python 3.10、LibreOffice、Liberation、Noto CJK、Carlitoを含む任意の開発環境です。
+ホストへLibreOfficeやフォントをインストールしたくない場合は、VS CodeでリポジトリをDev Containerとして開いてください。
+一般環境でのインストールとDocker実行にはDev Containerを必要としません。
 
 ## Testing
 
 Gatewayの自動テストを実行します。vLLM呼び出しはモックされるため、GPUサーバーは不要です。
 
 ```bash
-./.venv/bin/python -m unittest discover -s tests -v
-```
-
-PoCの変換回帰テストは別に実行できます。
-
-```bash
-cd poc_image_convert
-../.venv/bin/python -m unittest -v test_convert_to_images.py
+python -m pip install -e '.[test]'
+python -m unittest discover -s tests/test_app -v
 ```
 
 実機確認では、PDF、PPTX、DOCX、XLSXの変換と、ResponsesおよびChat Completionsの`file_id`、`file_data`、Responsesの`file_url`入力を確認しています。
 
 ## Contributing
 
-IssueやPull Requestを歓迎します。変更は小さく保ち、関連するテストを追加または更新してください。文書変換結果を変更する場合は、LibreOffice、フォント、PyMuPDF、Pillowのバージョン差も考慮してください。
+IssueやPull Requestを歓迎します。変更は小さく保ち、関連するテストを追加または更新してください。文書変換結果を変更する場合は、外部ライブラリ、LibreOffice、フォント、PyMuPDFのバージョン差も考慮してください。
 
 大きな機能追加やAPI互換性の変更は、実装前にIssueで目的と互換性への影響を共有してください。
 
 ## Documentation
 
 - [Design document](DESIGN.md)
-- [OpenAI SDK sample](samples/openai_file_response.py)
+
+## License
+
+Released under the Apache License 2.0.
+See [LICENSE](LICENSE) for the full text.

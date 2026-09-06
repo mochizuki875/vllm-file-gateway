@@ -4,6 +4,9 @@
     "dockerfile": "Dockerfile",
     "context": ".."
   },
+  "mounts": [
+    "source=/etc/hosts,target=/etc/hosts,type=bind,readonly"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [

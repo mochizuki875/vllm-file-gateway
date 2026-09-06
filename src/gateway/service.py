@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import logging
 import shutil
 import socket
 import tempfile
@@ -18,9 +19,14 @@ from urllib.parse import unquote, urljoin, urlsplit
 import httpx
 
 from gateway.config import Settings
-from gateway.converter import ConversionError, convert_document, media_type_for, sha256_file
+from document_image_renderer import RendererError
+
+from gateway.converter import DocumentPageLimitError, convert_document, media_type_for, sha256_file
 from gateway.database import Database, StoredFile
 from gateway.errors import GatewayError
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)
@@ -39,17 +45,21 @@ class FileService:
 
     async def start(self) -> None:
         self.database.create_schema()
-        for file_id in self.database.pending():
+        # Resume conversions that were interrupted by a previous shutdown.
+        pending = self.database.pending()
+        for file_id in pending:
             await self.queue.put(file_id)
         self.tasks = [
             asyncio.create_task(self._worker(), name="conversion-worker"),
             asyncio.create_task(self._janitor(), name="file-janitor"),
         ]
+        logger.info("File service started: pending_files=%d", len(pending))
 
     async def stop(self) -> None:
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        logger.info("File service stopped")
 
     async def create_file(
         self,
@@ -94,6 +104,13 @@ class FileService:
         )
         self.database.add(record)
         await self.queue.put(file_id)
+        logger.info(
+            "File accepted: file_id=%s filename=%s bytes=%d media_type=%s",
+            file_id,
+            safe_name,
+            content_size,
+            record.media_type,
+        )
         return record
 
     async def _worker(self) -> None:
@@ -112,11 +129,20 @@ class FileService:
             source = self.settings.gateway_data_dir / record.source_path
             file_dir = source.parent
         self.database.update_status(file_id, "processing")
+        started_at = time.monotonic()
+        logger.info("Document conversion started: file_id=%s filename=%s", file_id, record.filename)
         try:
-            convert_document(source, file_dir / "derived")
+            result = convert_document(source, file_dir / "derived", self.settings.max_document_pages)
             manifest_path = str(Path(record.source_path).parent / "manifest.json")
             self.database.update_status(file_id, "processed", manifest_path=manifest_path)
+            logger.info(
+                "Document conversion completed: file_id=%s pages=%d duration_ms=%d",
+                file_id,
+                len(result.artifacts),
+                int((time.monotonic() - started_at) * 1000),
+            )
         except Exception as error:
+            logger.exception("Document conversion failed: file_id=%s filename=%s", file_id, record.filename)
             self.database.update_status(file_id, "failed", error_message=str(error)[:1000])
 
     async def _janitor(self) -> None:
@@ -131,6 +157,7 @@ class FileService:
             return False
         source = self.settings.gateway_data_dir / record.source_path
         shutil.rmtree(source.parent, ignore_errors=True)
+        logger.info("File deleted: file_id=%s filename=%s", file_id, record.filename)
         return True
 
     def resolve_stored(self, file_id: str, tenant_id: str, param: str) -> ResolvedDocument:
@@ -174,9 +201,11 @@ class DocumentResolver:
         if sources[0] == "file_data":
             filename = require_filename(reference, param)
             content = decode_file_data(str(reference["file_data"]), param)
+            logger.info("Resolving inline document: filename=%s bytes=%d", filename, len(content))
         else:
             content, filename = await self._download(str(reference["file_url"]), param)
             filename = str(reference.get("filename") or filename)
+            logger.info("Resolving downloaded document: filename=%s bytes=%d", Path(filename).name, len(content))
         if len(content) > self.settings.max_file_bytes:
             raise GatewayError(400, "file_too_large", "File exceeds the 50 MiB limit.", param)
         extension = Path(filename).suffix.lower()
@@ -184,10 +213,11 @@ class DocumentResolver:
         source.write_bytes(content)
         validate_signature(source, extension)
         try:
-            convert_document(source, root / "derived")
-        except ConversionError as error:
-            code = "too_many_pages" if "20 page" in str(error) else "file_processing_failed"
-            raise GatewayError(400, code, str(error), param) from error
+            convert_document(source, root / "derived", self.settings.max_document_pages)
+        except DocumentPageLimitError as error:
+            raise GatewayError(400, "too_many_pages", str(error), param) from error
+        except RendererError as error:
+            raise GatewayError(400, "file_processing_failed", str(error), param) from error
         return ResolvedDocument(
             Path(filename).name,
             root / "derived",
@@ -198,6 +228,7 @@ class DocumentResolver:
         current = url
         async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
             for _ in range(4):
+                # Validate every redirect target to prevent SSRF through a public first hop.
                 await validate_public_https_url(current, param)
                 async with client.stream("GET", current, headers={"Accept": "*/*"}) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
@@ -216,6 +247,12 @@ class DocumentResolver:
                             raise GatewayError(400, "file_too_large", "Downloaded file is too large.", param)
                         chunks.append(chunk)
                     name = Path(unquote(urlsplit(current).path)).name or "download.pdf"
+                    logger.info(
+                        "Document download completed: host=%s filename=%s bytes=%d",
+                        urlsplit(current).hostname,
+                        name,
+                        size,
+                    )
                     return b"".join(chunks), name
         raise GatewayError(400, "invalid_file_url", "Too many redirects.", param)
 
@@ -227,9 +264,11 @@ def document_parts(
 ) -> list[dict[str, object]]:
     pages = document.manifest["documents"][0]["pages"]  # type: ignore[index]
     parts: list[dict[str, object]] = []
+    # Preserve text from every page while limiting the more expensive image inputs.
     for page in pages:  # type: ignore[union-attr]
         number = page["page_number"]
         text = (document.derived_dir / page["text_path"]).read_text(encoding="utf-8")
+        image_media_type = page["media_type"]
         label = f'<document filename="{document.filename}" page="{number}">\n{text}\n</document>'
         if input_kind == "responses":
             parts.append({"type": "input_text", "text": label})
@@ -239,7 +278,7 @@ def document_parts(
                     {
                         "type": "input_image",
                         "detail": "auto",
-                        "image_url": f"data:image/webp;base64,{image}",
+                        "image_url": f"data:{image_media_type};base64,{image}",
                     }
                 )
         else:
@@ -247,7 +286,7 @@ def document_parts(
             if number <= max_images:
                 image = base64.b64encode((document.derived_dir / page["image_path"]).read_bytes()).decode("ascii")
                 parts.append(
-                    {"type": "image_url", "image_url": {"url": f"data:image/webp;base64,{image}"}}
+                    {"type": "image_url", "image_url": {"url": f"data:{image_media_type};base64,{image}"}}
                 )
     return parts
 

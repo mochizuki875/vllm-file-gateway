@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/python:1-3.13-bookworm
+FROM mcr.microsoft.com/devcontainers/python:1-3.10-bookworm
 
 RUN rm -f /etc/apt/sources.list.d/yarn.list \
     && apt-get update \
@@ -16,6 +16,7 @@ RUN rm -f /etc/apt/sources.list.d/yarn.list \
 
     RUN fc-cache -f
 
-COPY poc_image_convert/requirements.txt /tmp/poc-requirements.txt
+COPY pyproject.toml README.md LICENSE /tmp/project/
+COPY src/ /tmp/project/src/
 
-RUN python -m pip install --no-cache-dir -r /tmp/poc-requirements.txt
+RUN python -m pip install --no-cache-dir /tmp/project
